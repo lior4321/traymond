@@ -58,6 +58,9 @@ std::vector<std::wstring> g_autoMinimizeList;
 // Global ImageList for dialog icons
 HIMAGELIST g_hImageList = nullptr;
 
+// Track settings dialog state
+HWND g_hSettingsDlg = nullptr;
+
 // Startup registry functions
 void SetStartup(bool enable) {
     HKEY hKey;
@@ -146,6 +149,9 @@ INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM 
     switch (message) {
     case WM_INITDIALOG:
         {
+            // Store dialog handle globally
+            g_hSettingsDlg = hDlg;
+            
             CheckDlgButton(hDlg, IDC_CHK_STARTUP, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED);
             
             // Initialize ListView columns
@@ -203,12 +209,14 @@ INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM 
             // Save startup setting
             SetStartup(IsDlgButtonChecked(hDlg, IDC_CHK_STARTUP) == BST_CHECKED);
             SaveAutoList();
+            g_hSettingsDlg = nullptr; // Clear dialog handle
             EndDialog(hDlg, LOWORD(wParam));
             return (INT_PTR)TRUE;
         } 
         else if (LOWORD(wParam) == IDCANCEL) {
             // Reload to cancel unsaved changes
             LoadAutoList();
+            g_hSettingsDlg = nullptr; // Clear dialog handle
             EndDialog(hDlg, LOWORD(wParam));
             return (INT_PTR)TRUE;
         }
@@ -255,7 +263,7 @@ public:
         CreateTrayIcon();
         CreateTrayMenu();
         LoadState(); // Recovery from crash
-        LoadAutoMinimizeList(); // Load auto-minimize settings
+        LoadAutoList(); // Load auto-minimize settings
 
         return true;
     }
@@ -300,7 +308,15 @@ private:
                 // Main Traymond icon
                 if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
                     // Double-click opens settings
-                    DialogBoxW(m_hInstance, MAKEINTRESOURCE(IDD_SETTINGS), m_mainWindow, SettingsDlgProc);
+                    // Check if dialog is already open
+                    if (g_hSettingsDlg && IsWindow(g_hSettingsDlg)) {
+                        // Focus existing dialog
+                        SetForegroundWindow(g_hSettingsDlg);
+                        SetActiveWindow(g_hSettingsDlg);
+                    } else {
+                        // Open new dialog
+                        DialogBoxW(m_hInstance, MAKEINTRESOURCE(IDD_SETTINGS), m_mainWindow, SettingsDlgProc);
+                    }
                 }
                 else if (LOWORD(lParam) == WM_RBUTTONUP) {
                     // Right-click shows main menu
@@ -331,7 +347,15 @@ private:
             switch (LOWORD(wParam)) {
             case MENU_RESTORE_ALL_ID: RestoreAllWindows(); break;
             case MENU_SETTINGS_ID: 
-                DialogBox(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_SETTINGS), hwnd, SettingsDlgProc);
+                // Check if dialog is already open
+                if (g_hSettingsDlg && IsWindow(g_hSettingsDlg)) {
+                    // Focus existing dialog
+                    SetForegroundWindow(g_hSettingsDlg);
+                    SetActiveWindow(g_hSettingsDlg);
+                } else {
+                    // Open new dialog
+                    DialogBox(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_SETTINGS), hwnd, SettingsDlgProc);
+                }
                 break;
             case MENU_EXIT_ID: PostQuitMessage(0); break;
             }
