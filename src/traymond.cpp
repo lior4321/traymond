@@ -8,12 +8,23 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <shellapi.h>
+#include <commctrl.h>
+#include <commdlg.h>
+#include <shlwapi.h>
 #include <vector>
 #include <string>
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
 #include <memory>
+
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "shlwapi.lib")
+
+// Enable Visual Styles for modern Windows UI
+#pragma comment(linker,"\"/manifestdependency:type='win32' \
+name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
+processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 // Constants using modern constexpr
 constexpr UINT WM_TRAYICON = WM_APP + 1;
@@ -28,6 +39,9 @@ constexpr wchar_t MUTEX_NAME[] = L"Global\\Traymond_Single_Instance_Mutex";
 #define IDD_SETTINGS 102
 #define IDC_CHK_STARTUP 1001
 #define IDC_EDIT_AUTOLIST 1002
+#define IDC_LIST_APPS 1005
+#define IDC_BTN_ADD 1006
+#define IDC_BTN_REMOVE 1007
 
 // Data files
 const std::wstring DATA_FILENAME = L"traymond_recovery.dat";
@@ -40,6 +54,9 @@ struct HiddenWindow {
 
 // Global auto-minimize list
 std::vector<std::wstring> g_autoMinimizeList;
+
+// Global ImageList for dialog icons
+HIMAGELIST g_hImageList = nullptr;
 
 // Startup registry functions
 void SetStartup(bool enable) {
@@ -73,7 +90,7 @@ bool IsStartupEnabled() {
 }
 
 // Auto-minimize list management
-void LoadAutoMinimizeList() {
+void LoadAutoList() {
     std::wifstream infile(AUTO_MINIMIZE_FILE);
     std::wstring line;
     g_autoMinimizeList.clear();
@@ -84,10 +101,42 @@ void LoadAutoMinimizeList() {
     }
 }
 
-void SaveAutoMinimizeList() {
+void SaveAutoList() {
     std::wofstream outfile(AUTO_MINIMIZE_FILE);
     for (const auto &name : g_autoMinimizeList) {
         outfile << name << std::endl;
+    }
+}
+
+// Refresh the application list in the settings dialog
+void RefreshAppList(HWND hDlg) {
+    HWND hList = GetDlgItem(hDlg, IDC_LIST_APPS);
+    ListView_DeleteAllItems(hList);
+    
+    // Create new ImageList for small icons
+    if (g_hImageList) ImageList_Destroy(g_hImageList);
+    g_hImageList = ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, 1, 1);
+    ListView_SetImageList(hList, g_hImageList, LVSIL_SMALL);
+
+    int index = 0;
+    for (const auto& path : g_autoMinimizeList) {
+        // Extract icon from file
+        SHFILEINFOW sfi = { 0 };
+        SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_SMALLICON);
+        
+        int iconIndex = -1;
+        if (sfi.hIcon) {
+            iconIndex = ImageList_AddIcon(g_hImageList, sfi.hIcon);
+            DestroyIcon(sfi.hIcon);
+        }
+
+        // Add to list
+        LVITEMW lvi = { 0 };
+        lvi.mask = LVIF_TEXT | LVIF_IMAGE;
+        lvi.iItem = index++;
+        lvi.iImage = iconIndex;
+        lvi.pszText = const_cast<LPWSTR>(path.c_str());
+        ListView_InsertItem(hList, &lvi);
     }
 }
 
@@ -96,36 +145,70 @@ INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM 
     UNREFERENCED_PARAMETER(lParam);
     switch (message) {
     case WM_INITDIALOG:
-        CheckDlgButton(hDlg, IDC_CHK_STARTUP, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED);
         {
-            std::wstring allText;
-            for (const auto &s : g_autoMinimizeList) {
-                allText += s + L"\r\n";
-            }
-            SetDlgItemTextW(hDlg, IDC_EDIT_AUTOLIST, allText.c_str());
+            CheckDlgButton(hDlg, IDC_CHK_STARTUP, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED);
+            
+            // Initialize ListView columns
+            HWND hList = GetDlgItem(hDlg, IDC_LIST_APPS);
+            LVCOLUMNW lvc = { 0 };
+            lvc.mask = LVCF_FMT | LVCF_WIDTH | LVCF_TEXT;
+            lvc.fmt = LVCFMT_LEFT;
+            lvc.cx = 300;
+            lvc.pszText = (LPWSTR)L"Application Path";
+            ListView_InsertColumn(hList, 0, &lvc);
+            
+            // Set extended style for full row select
+            ListView_SetExtendedListViewStyle(hList, LVS_EX_FULLROWSELECT);
+
+            RefreshAppList(hDlg);
         }
         return (INT_PTR)TRUE;
 
     case WM_COMMAND:
-        if (LOWORD(wParam) == IDOK) {
+        if (LOWORD(wParam) == IDC_BTN_ADD) {
+            // Open file browser dialog
+            wchar_t filename[MAX_PATH] = { 0 };
+            OPENFILENAMEW ofn = { 0 };
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hDlg;
+            ofn.lpstrFilter = L"Executables (*.exe)\\0*.exe\\0All Files (*.*)\\0*.*\\0";
+            ofn.lpstrFile = filename;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+            
+            if (GetOpenFileNameW(&ofn)) {
+                // Check if already exists
+                bool exists = false;
+                std::wstring newPath = filename;
+                for(const auto& s : g_autoMinimizeList) {
+                    if(s == newPath) { exists = true; break; }
+                }
+                
+                if(!exists) {
+                    g_autoMinimizeList.push_back(newPath);
+                    RefreshAppList(hDlg);
+                }
+            }
+        }
+        else if (LOWORD(wParam) == IDC_BTN_REMOVE) {
+            // Remove selected item
+            HWND hList = GetDlgItem(hDlg, IDC_LIST_APPS);
+            int selected = ListView_GetNextItem(hList, -1, LVNI_SELECTED);
+            if (selected != -1 && selected < (int)g_autoMinimizeList.size()) {
+                g_autoMinimizeList.erase(g_autoMinimizeList.begin() + selected);
+                RefreshAppList(hDlg);
+            }
+        }
+        else if (LOWORD(wParam) == IDOK) {
             // Save startup setting
             SetStartup(IsDlgButtonChecked(hDlg, IDC_CHK_STARTUP) == BST_CHECKED);
-            
-            // Save auto-minimize list from text box
-            wchar_t buf[4096];
-            GetDlgItemTextW(hDlg, IDC_EDIT_AUTOLIST, buf, 4096);
-            std::wstringstream ss(buf);
-            std::wstring item;
-            g_autoMinimizeList.clear();
-            while (std::getline(ss, item)) {
-                // Remove carriage return characters
-                item.erase(std::remove(item.begin(), item.end(), L'\r'), item.end());
-                if(!item.empty()) g_autoMinimizeList.push_back(item);
-            }
-            SaveAutoMinimizeList();
+            SaveAutoList();
             EndDialog(hDlg, LOWORD(wParam));
             return (INT_PTR)TRUE;
-        } else if (LOWORD(wParam) == IDCANCEL) {
+        } 
+        else if (LOWORD(wParam) == IDCANCEL) {
+            // Reload to cancel unsaved changes
+            LoadAutoList();
             EndDialog(hDlg, LOWORD(wParam));
             return (INT_PTR)TRUE;
         }
@@ -212,21 +295,31 @@ private:
     LRESULT HandleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
         switch (uMsg) {
         case WM_TRAYICON:
-            if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
-                UINT uID = HIWORD(lParam);
-                if (uID == 0) {
-                    // Main tray icon double-clicked - open settings
-                    DialogBox(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_SETTINGS), hwnd, SettingsDlgProc);
-                } else {
-                    // Specific window icon - restore it
-                    RestoreWindowById(uID);
+            // CRITICAL FIX: wParam contains the icon ID, not lParam
+            if (wParam == 0) {
+                // Main Traymond icon
+                if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
+                    // Double-click opens settings
+                    DialogBoxW(m_hInstance, MAKEINTRESOURCE(IDD_SETTINGS), m_mainWindow, SettingsDlgProc);
                 }
-            } else if (LOWORD(lParam) == WM_RBUTTONUP) {
-                // Show main app context menu
-                POINT pt;
-                GetCursorPos(&pt);
-                SetForegroundWindow(hwnd);
-                TrackPopupMenu(m_trayMenu, TPM_BOTTOMALIGN | TPM_RIGHTALIGN, pt.x, pt.y, 0, hwnd, nullptr);
+                else if (LOWORD(lParam) == WM_RBUTTONUP) {
+                    // Right-click shows main menu
+                    POINT pt;
+                    GetCursorPos(&pt);
+                    SetForegroundWindow(hwnd);
+                    TrackPopupMenu(m_trayMenu, TPM_BOTTOMALIGN | TPM_RIGHTALIGN, pt.x, pt.y, 0, hwnd, nullptr);
+                }
+            }
+            else {
+                // Minimized window icon (wParam is the HWND)
+                if (LOWORD(lParam) == WM_LBUTTONDBLCLK || LOWORD(lParam) == WM_LBUTTONUP) {
+                    // Double-click or single click restores the window
+                    RestoreWindowById((UINT)wParam);
+                }
+                else if (LOWORD(lParam) == WM_RBUTTONUP) {
+                    // Right-click also restores (or could show context menu)
+                    RestoreWindowById((UINT)wParam);
+                }
             }
             break;
 
