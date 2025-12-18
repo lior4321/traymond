@@ -354,3 +354,6 @@ ASALocalRun/
 .mfractor/
 
 traymond_hotkeys.txt
+
+# Release executables
+releases/
