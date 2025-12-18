@@ -11,15 +11,18 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shlwapi.h>
+#include <psapi.h>
 #include <vector>
 #include <string>
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
 #include <memory>
+#include <set>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "psapi.lib")
 
 // Enable Visual Styles for modern Windows UI
 #pragma comment(linker,"\"/manifestdependency:type='win32' \
@@ -28,6 +31,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 // Constants using modern constexpr
 constexpr UINT WM_TRAYICON = WM_APP + 1;
+constexpr UINT WM_AUTO_MINIMIZE = WM_APP + 2;
 constexpr UINT MENU_EXIT_ID = 1001;
 constexpr UINT MENU_RESTORE_ALL_ID = 1002;
 constexpr UINT MENU_SETTINGS_ID = 1003;
@@ -42,10 +46,13 @@ constexpr wchar_t MUTEX_NAME[] = L"Global\\Traymond_Single_Instance_Mutex";
 #define IDC_LIST_APPS 1005
 #define IDC_BTN_ADD 1006
 #define IDC_BTN_REMOVE 1007
+#define IDC_HOTKEY_MINIMIZE 1008
+#define IDC_HOTKEY_AUTOADD 1009
 
 // Data files
 const std::wstring DATA_FILENAME = L"traymond_recovery.dat";
 const std::wstring AUTO_MINIMIZE_FILE = L"traymond_auto.txt";
+const std::wstring HOTKEY_SETTINGS_FILE = L"traymond_hotkeys.txt";
 
 struct HiddenWindow {
     HWND hWnd;
@@ -58,8 +65,24 @@ std::vector<std::wstring> g_autoMinimizeList;
 // Global ImageList for dialog icons
 HIMAGELIST g_hImageList = nullptr;
 
+// Global event hook and main window handle for auto-minimize
+HWINEVENTHOOK g_hEventHook = nullptr;
+HWND g_hMainWnd = nullptr;
+
+// Set of windows being restored (to prevent immediate re-minimization)
+std::set<HWND> g_restoringWindows;
+
 // Track settings dialog state
 HWND g_hSettingsDlg = nullptr;
+
+// Hotkey configuration (modifier | virtualKey, 0 means disabled)
+struct HotkeyConfig {
+    UINT modifiers;
+    UINT vk;
+    bool enabled;
+};
+HotkeyConfig g_hotkeyMinimize = { MOD_WIN | MOD_SHIFT, 'Z', true };  // Default: Win+Shift+Z
+HotkeyConfig g_hotkeyAutoAdd = { MOD_WIN | MOD_SHIFT, 'A', false };   // Default: disabled (to avoid conflicts)
 
 // Startup registry functions
 void SetStartup(bool enable) {
@@ -108,6 +131,88 @@ void SaveAutoList() {
     std::wofstream outfile(AUTO_MINIMIZE_FILE);
     for (const auto &name : g_autoMinimizeList) {
         outfile << name << std::endl;
+    }
+}
+
+void LoadHotkeySettings() {
+    std::wifstream infile(HOTKEY_SETTINGS_FILE);
+    if (!infile) return;
+    
+    std::wstring line;
+    // Line 1: Minimize hotkey
+    if (std::getline(infile, line)) {
+        int mods, vk, enabled;
+        if (swscanf_s(line.c_str(), L"%d,%d,%d", &mods, &vk, &enabled) == 3) {
+            g_hotkeyMinimize = { (UINT)mods, (UINT)vk, enabled != 0 };
+        }
+    }
+    // Line 2: Auto-add hotkey
+    if (std::getline(infile, line)) {
+        int mods, vk, enabled;
+        if (swscanf_s(line.c_str(), L"%d,%d,%d", &mods, &vk, &enabled) == 3) {
+            g_hotkeyAutoAdd = { (UINT)mods, (UINT)vk, enabled != 0 };
+        }
+    }
+}
+
+void SaveHotkeySettings() {
+    std::wofstream outfile(HOTKEY_SETTINGS_FILE);
+    outfile << g_hotkeyMinimize.modifiers << L"," << g_hotkeyMinimize.vk << L"," << (g_hotkeyMinimize.enabled ? 1 : 0) << std::endl;
+    outfile << g_hotkeyAutoAdd.modifiers << L"," << g_hotkeyAutoAdd.vk << L"," << (g_hotkeyAutoAdd.enabled ? 1 : 0) << std::endl;
+}
+
+// Event hook callback to detect new windows and auto-minimize them
+void CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, 
+                           LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) 
+{
+    UNREFERENCED_PARAMETER(hWinEventHook);
+    UNREFERENCED_PARAMETER(dwEventThread);
+    UNREFERENCED_PARAMETER(dwmsEventTime);
+    
+    // Only interested in main windows being shown
+    if (event == EVENT_OBJECT_SHOW && idObject == OBJID_WINDOW && idChild == CHILDID_SELF) {
+        // Skip if window is being restored by user
+        if (g_restoringWindows.count(hwnd) > 0) return;
+        
+        // Only process visible windows with title bars (main application windows)
+        if (!IsWindowVisible(hwnd)) return;
+        
+        // Check window styles - must be a main application window
+        LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+        LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        
+        // Skip if not a main window (must have caption and be overlapped/popup style)
+        if (!(style & WS_CAPTION)) return;
+        if (!(style & (WS_OVERLAPPEDWINDOW | WS_POPUP))) return;
+        
+        // Skip tool windows, app bar windows, and other auxiliary windows
+        if (exStyle & WS_EX_TOOLWINDOW) return;
+        if (exStyle & WS_EX_NOACTIVATE) return;
+        
+        // Must have a window title
+        if (GetWindowTextLengthW(hwnd) == 0) return;
+
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (hProcess) {
+            wchar_t processPath[MAX_PATH];
+            if (GetModuleFileNameExW(hProcess, NULL, processPath, MAX_PATH)) {
+                std::wstring fullPath = processPath;
+                
+                // Check if path exists in our auto-minimize list
+                for (const auto& target : g_autoMinimizeList) {
+                    // Case-insensitive comparison
+                    if (_wcsicmp(fullPath.c_str(), target.c_str()) == 0) {
+                        // Found a match! Send message to main window to minimize it safely
+                        PostMessageW(g_hMainWnd, WM_AUTO_MINIMIZE, (WPARAM)hwnd, 0);
+                        break;
+                    }
+                }
+            }
+            CloseHandle(hProcess);
+        }
     }
 }
 
@@ -167,6 +272,28 @@ INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM 
             ListView_SetExtendedListViewStyle(hList, LVS_EX_FULLROWSELECT);
 
             RefreshAppList(hDlg);
+            
+            // Initialize hotkey controls
+            HWND hHotkeyMin = GetDlgItem(hDlg, IDC_HOTKEY_MINIMIZE);
+            HWND hHotkeyAdd = GetDlgItem(hDlg, IDC_HOTKEY_AUTOADD);
+            
+            if (g_hotkeyMinimize.enabled) {
+                WORD modifiers = 0;
+                if (g_hotkeyMinimize.modifiers & MOD_ALT) modifiers |= HOTKEYF_ALT;
+                if (g_hotkeyMinimize.modifiers & MOD_CONTROL) modifiers |= HOTKEYF_CONTROL;
+                if (g_hotkeyMinimize.modifiers & MOD_SHIFT) modifiers |= HOTKEYF_SHIFT;
+                if (g_hotkeyMinimize.modifiers & MOD_WIN) modifiers |= HOTKEYF_EXT;
+                SendMessageW(hHotkeyMin, HKM_SETHOTKEY, MAKEWORD(g_hotkeyMinimize.vk, modifiers), 0);
+            }
+            
+            if (g_hotkeyAutoAdd.enabled) {
+                WORD modifiers = 0;
+                if (g_hotkeyAutoAdd.modifiers & MOD_ALT) modifiers |= HOTKEYF_ALT;
+                if (g_hotkeyAutoAdd.modifiers & MOD_CONTROL) modifiers |= HOTKEYF_CONTROL;
+                if (g_hotkeyAutoAdd.modifiers & MOD_SHIFT) modifiers |= HOTKEYF_SHIFT;
+                if (g_hotkeyAutoAdd.modifiers & MOD_WIN) modifiers |= HOTKEYF_EXT;
+                SendMessageW(hHotkeyAdd, HKM_SETHOTKEY, MAKEWORD(g_hotkeyAutoAdd.vk, modifiers), 0);
+            }
         }
         return (INT_PTR)TRUE;
 
@@ -174,10 +301,12 @@ INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM 
         if (LOWORD(wParam) == IDC_BTN_ADD) {
             // Open file browser dialog
             wchar_t filename[MAX_PATH] = { 0 };
+            // Use proper null terminator array for filter
+            static wchar_t szFilter[] = L"Executables (*.exe)\0*.exe\0All Files (*.*)\0*.*\0";
             OPENFILENAMEW ofn = { 0 };
             ofn.lStructSize = sizeof(ofn);
             ofn.hwndOwner = hDlg;
-            ofn.lpstrFilter = L"Executables (*.exe)\\0*.exe\\0All Files (*.*)\\0*.*\\0";
+            ofn.lpstrFilter = szFilter;
             ofn.lpstrFile = filename;
             ofn.nMaxFile = MAX_PATH;
             ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
@@ -209,6 +338,75 @@ INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM 
             // Save startup setting
             SetStartup(IsDlgButtonChecked(hDlg, IDC_CHK_STARTUP) == BST_CHECKED);
             SaveAutoList();
+            
+            // Read hotkey settings from controls
+            HWND hHotkeyMin = GetDlgItem(hDlg, IDC_HOTKEY_MINIMIZE);
+            HWND hHotkeyAdd = GetDlgItem(hDlg, IDC_HOTKEY_AUTOADD);
+            
+            DWORD hotkeyMin = (DWORD)SendMessageW(hHotkeyMin, HKM_GETHOTKEY, 0, 0);
+            DWORD hotkeyAdd = (DWORD)SendMessageW(hHotkeyAdd, HKM_GETHOTKEY, 0, 0);
+            
+            // Parse minimize hotkey
+            BYTE vkMin = LOBYTE(hotkeyMin);
+            BYTE modMin = HIBYTE(hotkeyMin);
+            if (vkMin != 0) {
+                g_hotkeyMinimize.vk = vkMin;
+                g_hotkeyMinimize.modifiers = 0;
+                if (modMin & HOTKEYF_ALT) g_hotkeyMinimize.modifiers |= MOD_ALT;
+                if (modMin & HOTKEYF_CONTROL) g_hotkeyMinimize.modifiers |= MOD_CONTROL;
+                if (modMin & HOTKEYF_SHIFT) g_hotkeyMinimize.modifiers |= MOD_SHIFT;
+                if (modMin & HOTKEYF_EXT) g_hotkeyMinimize.modifiers |= MOD_WIN;
+                g_hotkeyMinimize.enabled = true;
+            } else {
+                g_hotkeyMinimize.enabled = false;
+            }
+            
+            // Parse auto-add hotkey
+            BYTE vkAdd = LOBYTE(hotkeyAdd);
+            BYTE modAdd = HIBYTE(hotkeyAdd);
+            if (vkAdd != 0) {
+                g_hotkeyAutoAdd.vk = vkAdd;
+                g_hotkeyAutoAdd.modifiers = 0;
+                if (modAdd & HOTKEYF_ALT) g_hotkeyAutoAdd.modifiers |= MOD_ALT;
+                if (modAdd & HOTKEYF_CONTROL) g_hotkeyAutoAdd.modifiers |= MOD_CONTROL;
+                if (modAdd & HOTKEYF_SHIFT) g_hotkeyAutoAdd.modifiers |= MOD_SHIFT;
+                if (modAdd & HOTKEYF_EXT) g_hotkeyAutoAdd.modifiers |= MOD_WIN;
+                g_hotkeyAutoAdd.enabled = true;
+            } else {
+                g_hotkeyAutoAdd.enabled = false;
+            }
+            
+            SaveHotkeySettings();
+            
+            // Apply hotkey changes immediately without restart
+            // Unregister old hotkeys
+            UnregisterHotKey(g_hMainWnd, 1);
+            UnregisterHotKey(g_hMainWnd, 2);
+            
+            // Register new hotkeys with graceful error handling
+            bool hotkey1Success = true;
+            bool hotkey2Success = true;
+            
+            if (g_hotkeyMinimize.enabled) {
+                if (!RegisterHotKey(g_hMainWnd, 1, g_hotkeyMinimize.modifiers | MOD_NOREPEAT, g_hotkeyMinimize.vk)) {
+                    g_hotkeyMinimize.enabled = false;
+                    hotkey1Success = false;
+                }
+            }
+            
+            if (g_hotkeyAutoAdd.enabled) {
+                if (!RegisterHotKey(g_hMainWnd, 2, g_hotkeyAutoAdd.modifiers | MOD_NOREPEAT, g_hotkeyAutoAdd.vk)) {
+                    g_hotkeyAutoAdd.enabled = false;
+                    hotkey2Success = false;
+                }
+            }
+            
+            // Show appropriate message based on registration results
+            if (!hotkey1Success || !hotkey2Success) {
+                MessageBoxW(hDlg, L"Some hotkeys could not be registered (conflict with another application). They have been disabled.", 
+                           L"Hotkey Conflict", MB_ICONWARNING);
+            }
+            
             g_hSettingsDlg = nullptr; // Clear dialog handle
             EndDialog(hDlg, LOWORD(wParam));
             return (INT_PTR)TRUE;
@@ -230,8 +428,18 @@ public:
     TraymondApp(HINSTANCE hInstance) : m_hInstance(hInstance), m_mainWindow(nullptr), m_trayMenu(nullptr) {}
 
     ~TraymondApp() {
+        // Unhook the window event monitoring
+        if (g_hEventHook) {
+            UnhookWinEvent(g_hEventHook);
+            g_hEventHook = nullptr;
+        }
+        
         RestoreAllWindows();
-        if (m_mainWindow) DestroyWindow(m_mainWindow);
+        if (m_mainWindow) {
+            UnregisterHotKey(m_mainWindow, 1);
+            UnregisterHotKey(m_mainWindow, 2);
+            DestroyWindow(m_mainWindow);
+        }
         if (m_trayMenu) DestroyMenu(m_trayMenu);
     }
 
@@ -255,9 +463,34 @@ public:
         m_mainWindow = CreateWindowExW(0, APP_CLASS_NAME, APP_TITLE, 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, m_hInstance, this);
         if (!m_mainWindow) return false;
 
-        if (!RegisterHotKey(m_mainWindow, 1, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'Z')) {
-            MessageBoxW(nullptr, L"Could not register hotkey Win+Shift+Z.", APP_TITLE, MB_ICONERROR);
-            return false;
+        // Store main window handle globally for WinEventProc callback
+        g_hMainWnd = m_mainWindow;
+
+        // Register WinEventHook to monitor new windows for auto-minimize
+        g_hEventHook = SetWinEventHook(
+            EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW,
+            nullptr,
+            WinEventProc,
+            0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+        );
+
+        // Load hotkey settings
+        LoadHotkeySettings();
+        
+        // Register hotkeys with graceful error handling
+        if (g_hotkeyMinimize.enabled) {
+            if (!RegisterHotKey(m_mainWindow, 1, g_hotkeyMinimize.modifiers | MOD_NOREPEAT, g_hotkeyMinimize.vk)) {
+                // Failed to register - just disable it, don't crash
+                g_hotkeyMinimize.enabled = false;
+            }
+        }
+        
+        if (g_hotkeyAutoAdd.enabled) {
+            if (!RegisterHotKey(m_mainWindow, 2, g_hotkeyAutoAdd.modifiers | MOD_NOREPEAT, g_hotkeyAutoAdd.vk)) {
+                // Failed to register - just disable it, don't crash
+                g_hotkeyAutoAdd.enabled = false;
+            }
         }
 
         CreateTrayIcon();
@@ -340,7 +573,17 @@ private:
             break;
 
         case WM_HOTKEY:
-            MinimizeForegroundWindow();
+            if (wParam == 1) { // Win+Shift+Z (Minimize)
+                MinimizeForegroundWindow();
+            }
+            else if (wParam == 2) { // Win+Shift+A (Add to auto-list)
+                AddForegroundToAutoList();
+            }
+            break;
+
+        case WM_AUTO_MINIMIZE:
+            // Sent by WinEventProc when a window from the auto-minimize list is detected
+            MinimizeWindow((HWND)wParam);
             break;
 
         case WM_COMMAND:
@@ -369,9 +612,9 @@ private:
         return DefWindowProcW(hwnd, uMsg, wParam, lParam);
     }
 
-    void MinimizeForegroundWindow() {
-        HWND hTarget = GetForegroundWindow();
-        if (!hTarget) return;
+    // Core minimize logic - can be called for any window
+    void MinimizeWindow(HWND hTarget) {
+        if (!hTarget || !IsWindow(hTarget)) return;
 
         // Validation: Don't minimize self or desktop/taskbar
         if (hTarget == GetDesktopWindow() || hTarget == FindWindowW(L"Shell_TrayWnd", nullptr)) return;
@@ -404,26 +647,115 @@ private:
         }
     }
 
+    // Wrapper for hotkey - minimizes the currently focused window
+    void MinimizeForegroundWindow() {
+        HWND hTarget = GetForegroundWindow();
+        MinimizeWindow(hTarget);
+    }
+
+    // Add foreground window to auto-minimize list (Win+Shift+A)
+    void AddForegroundToAutoList() {
+        HWND hTarget = GetForegroundWindow();
+        if (!hTarget) return;
+
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hTarget, &pid);
+        if (pid == 0) {
+            ShowBalloonTip(L"Error", L"Could not determine process.");
+            return;
+        }
+
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!hProcess) {
+            ShowBalloonTip(L"Error", L"Could not open process.");
+            return;
+        }
+
+        wchar_t processPath[MAX_PATH];
+        if (!GetModuleFileNameExW(hProcess, NULL, processPath, MAX_PATH)) {
+            CloseHandle(hProcess);
+            ShowBalloonTip(L"Error", L"Could not get process path.");
+            return;
+        }
+        CloseHandle(hProcess);
+
+        std::wstring procPath = processPath;
+
+        // Check if already exists
+        bool exists = false;
+        for (const auto& s : g_autoMinimizeList) {
+            if (_wcsicmp(s.c_str(), procPath.c_str()) == 0) {
+                exists = true;
+                break;
+            }
+        }
+
+        if (exists) {
+            ShowBalloonTip(L"Info", L"Application is already in auto-minimize list.");
+        } else {
+            g_autoMinimizeList.push_back(procPath);
+            SaveAutoList();
+            
+            // Refresh dialog if open
+            if (g_hSettingsDlg && IsWindow(g_hSettingsDlg)) {
+                RefreshAppList(g_hSettingsDlg);
+            }
+            
+            wchar_t msg[MAX_PATH + 50];
+            swprintf_s(msg, L"Added to auto-minimize:\n%s", procPath.c_str());
+            ShowBalloonTip(L"Success", msg);
+        }
+    }
+
+    // Show balloon tip notification in tray
+    void ShowBalloonTip(const wchar_t* title, const wchar_t* msg) {
+        NOTIFYICONDATAW nid = { sizeof(NOTIFYICONDATAW) };
+        nid.hWnd = m_mainWindow;
+        nid.uID = 0; // Main icon
+        nid.uFlags = NIF_INFO;
+        wcscpy_s(nid.szInfoTitle, title);
+        wcscpy_s(nid.szInfo, msg);
+        nid.dwInfoFlags = NIIF_INFO;
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+
     void RestoreWindowById(UINT uID) {
         auto it = std::find_if(m_hiddenWindows.begin(), m_hiddenWindows.end(), 
             [uID](const HiddenWindow& hw) { return hw.iconData.uID == uID; });
 
         if (it != m_hiddenWindows.end()) {
-            ShowWindow(it->hWnd, SW_SHOW);
-            SetForegroundWindow(it->hWnd);
+            HWND hwnd = it->hWnd;
+            
+            // Add to restoring set to prevent immediate re-minimization
+            g_restoringWindows.insert(hwnd);
+            
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
             Shell_NotifyIconW(NIM_DELETE, &it->iconData);
             m_hiddenWindows.erase(it);
             SaveState();
+            
+            // Remove from restoring set after 500ms delay
+            SetTimer(m_mainWindow, (UINT_PTR)hwnd, 500, [](HWND, UINT, UINT_PTR idEvent, DWORD) {
+                g_restoringWindows.erase((HWND)idEvent);
+            });
         }
     }
 
     void RestoreAllWindows() {
         for (auto& hw : m_hiddenWindows) {
+            // Add to restoring set to prevent immediate re-minimization
+            g_restoringWindows.insert(hw.hWnd);
             ShowWindow(hw.hWnd, SW_SHOW);
             Shell_NotifyIconW(NIM_DELETE, &hw.iconData);
         }
         m_hiddenWindows.clear();
         SaveState();
+        
+        // Clear restoring set after 500ms delay
+        SetTimer(m_mainWindow, 9999, 500, [](HWND, UINT, UINT_PTR, DWORD) {
+            g_restoringWindows.clear();
+        });
     }
 
     void CreateTrayIcon() {
