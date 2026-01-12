@@ -94,8 +94,11 @@ void SetStartup(bool enable) {
 
     if (RegOpenKeyExW(HKEY_CURRENT_USER, czRunKey, 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
         if (enable) {
-            DWORD pathLen = (wcslen(szPath) + 1) * sizeof(wchar_t);
-            RegSetValueExW(hKey, czAppName, 0, REG_SZ, (BYTE*)szPath, pathLen);
+            // Quote the path to handle spaces in directory names
+            wchar_t szQuotedPath[MAX_PATH + 3];
+            swprintf_s(szQuotedPath, L"\"%s\"", szPath);
+            DWORD pathLen = (wcslen(szQuotedPath) + 1) * sizeof(wchar_t);
+            RegSetValueExW(hKey, czAppName, 0, REG_SZ, (BYTE*)szQuotedPath, pathLen);
         } else {
             RegDeleteValueW(hKey, czAppName);
         }
